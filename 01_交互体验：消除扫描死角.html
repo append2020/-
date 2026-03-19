@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>扫描覆盖与遮挡模拟 - 测绘学交互学习</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; overflow-x: hidden; }
+        canvas { touch-action: none; cursor: crosshair; }
+        .stat-card { backdrop-filter: blur(8px); background: rgba(255, 255, 255, 0.9); }
+        #ui-overlay { pointer-events: none; }
+        #ui-overlay div, #ui-overlay button { pointer-events: auto; }
+        .scanner-pulse { animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { r: 5; opacity: 1; } 100% { r: 15; opacity: 0; } }
+    </style>
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+    const katexOptions = {
+        delimiters: [
+            {left: '\\[', right: '\\]', display: true},
+            {left: '\\(', right: '\\)', display: false},
+            {left: '$$', right: '$$', display: true},
+            {left: '$', right: '$', display: false}
+        ],
+        throwOnError: false,
+        strict: false,
+        trust: true
+    };
+
+    let renderTimeout;
+    function safeRender() {
+        if (renderTimeout) clearTimeout(renderTimeout);
+        renderTimeout = setTimeout(() => {
+            renderMathInElement(document.body, katexOptions);
+        }, 100);
+    }
+
+    renderMathInElement(document.body, katexOptions);
+
+    const observer = new MutationObserver((mutations) => {
+        let shouldRender = false;
+        mutations.forEach((mutation) => {
+            if (mutation.target &&
+                mutation.target.className &&
+                typeof mutation.target.className === 'string' &&
+                mutation.target.className.includes('katex')) {
+                return;
+            }
+            shouldRender = true;
+        });
+
+        if (shouldRender) {
+            safeRender();
+        }
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true
+    });
+
+    setInterval(() => {
+        const text = document.body.innerText;
+        if (text.includes('\\(') || text.includes('$$')) {
+            safeRender();
+        }
+    }, 2000);
+});
+</script>
+</head>
+<body class="bg-slate-50 text-slate-900">
+
+    <div class="flex flex-col h-screen">
+        <!-- 头部 -->
+        <header class="p-4 bg-white border-b shadow-sm z-10 flex justify-between items-center">
+            <div>
+                <h1 class="text-xl font-bold text-slate-800">三维激光扫描布站与遮挡模拟</h1>
+                <p class="text-xs text-slate-500">测绘学原理：视距(LoS)可见性与覆盖率评估</p>
+            </div>
+            <div class="flex gap-4 items-center">
+                <div class="text-right">
+                    <div class="text-sm font-semibold text-blue-600">当前覆盖率: <span id="coverage-val">0</span>%</div>
+                    <div class="text-xs text-slate-400">目标: ≥ 95%</div>
+                </div>
+                <button id="reset-btn" class="px-4 py-2 bg-slate-800 text-white text-sm rounded-lg hover:bg-slate-700 transition">重置场景</button>
+            </div>
+        </header>
+
+        <!-- 主交互区 -->
+        <main class="relative flex-grow overflow-hidden bg-slate-200">
+            <canvas id="simCanvas" class="w-full h-full"></canvas>
+            
+            <!-- 实时悬浮窗 -->
+            <div id="ui-overlay" class="absolute inset-0 p-6 flex flex-col justify-end pointer-events-none">
+                <div class="flex justify-between items-end">
+                    <div class="stat-card p-4 rounded-xl shadow-lg border border-slate-200 max-w-sm">
+                        <h3 class="font-bold text-sm mb-2">物理约束说明</h3>
+                        <ul class="text-xs space-y-2 text-slate-600">
+                            <li><strong>视距(LoS):</strong> \(V(p, s) \in \{0, 1\}\)，遇障碍物即形成阴影区。</li>
+                            <li><strong>最大量程:</strong> \(Distance(p, s) \le R_{max}\)，限制单站扫描半径。</li>
+                            <li><strong>空间互补:</strong> 利用多站点视角分散性消除单站扫描死角。</li>
+                            <li><strong>入射角限制:</strong> 掠射角过小时点云质量下降，表现为边缘变淡。</li>
+                        </ul>
+                    </div>
+
+                    <div class="stat-card p-4 rounded-xl shadow-lg border border-slate-200 text-center min-w-[120px]">
+                        <div class="text-3xl font-black text-slate-800" id="scanner-count">0</div>
+                        <div class="text-[10px] uppercase tracking-wider text-slate-400 font-bold">已布设站点</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 操作提示 -->
+            <div class="absolute top-4 left-1/2 -translate-x-1/2 px-4 py-1 bg-white/80 rounded-full text-xs shadow-sm border pointer-events-none">
+                点击地面区域布设激光扫描仪站点
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('simCanvas');
+        const ctx = canvas.getContext('2d');
+        const coverageVal = document.getElementById('coverage-val');
+        const scannerCountDisplay = document.getElementById('scanner-count');
+        const resetBtn = document.getElementById('reset-btn');
+
+        // 配置参数
+        const CONFIG = {
+            scannerRange: 250,
+            scannerColor: 'rgba(59, 130, 246, 0.4)',
+            obstacleColor: '#334155',
+            shadowColor: '#cbd5e1',
+            minIncidenceCos: Math.cos(Math.PI * 75 / 180), // 75度限制
+            gridRes: 15 // 计算覆盖率的网格步长
+        };
+
+        let scanners = [];
+        let obstacles = [];
+        let roomRect = { x: 0, y: 0, w: 0, h: 0 };
+
+        // 障碍物定义
+        function initObstacles() {
+            const w = canvas.width;
+            const h = canvas.height;
+            const pad = 40;
+            roomRect = { x: pad, y: pad, w: w - 2 * pad, h: h - 2 * pad };
+
+            obstacles = [
+                // 外墙
+                { type: 'rect', x: pad, y: pad, w: w - 2 * pad, h: 10 }, // 北
+                { type: 'rect', x: pad, y: h - pad - 10, w: w - 2 * pad, h: 10 }, // 南
+                { type: 'rect', x: pad, y: pad, w: 10, h: h - 2 * pad }, // 西
+                { type: 'rect', x: w - pad - 10, y: pad, w: 10, h: h - 2 * pad }, // 东
+                
+                // 内部障碍物 (承重柱)
+                { type: 'rect', x: w*0.3, y: h*0.3, w: 40, h: 40 },
+                { type: 'rect', x: w*0.7, y: h*0.6, w: 50, h: 50 },
+                
+                // 隔断墙
+                { type: 'rect', x: w*0.5 - 5, y: pad, w: 10, h: h*0.25 },
+                { type: 'rect', x: w*0.5 - 5, y: h*0.6, w: 10, h: h*0.4 - pad },
+                
+                // 家具模拟
+                { type: 'rect', x: w*0.15, y: h*0.7, w: 80, h: 30 },
+                { type: 'circle', x: w*0.8, y: h*0.25, r: 35 }
+            ];
+        }
+
+        function resize() {
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+            initObstacles();
+            draw();
+        }
+
+        window.addEventListener('resize', resize);
+        setTimeout(resize, 0);
+
+        // 碰撞检测：判断位置是否在障碍物内
+        function isPointInObstacle(x, y) {
+            for (let obs of obstacles) {
+                if (obs.type === 'rect') {
+                    if (x >= obs.x && x <= obs.x + obs.w && y >= obs.y && y <= obs.y + obs.h) return true;
+                } else if (obs.type === 'circle') {
+                    const d = Math.sqrt((x - obs.x)**2 + (y - obs.y)**2);
+                    if (d <= obs.r) return true;
+                }
+            }
+            return false;
+        }
+
+        // 获取所有顶点用于射线检测
+        function getEndpoints() {
+            let points = [];
+            obstacles.forEach(obs => {
+                if (obs.type === 'rect') {
+                    points.push({x: obs.x, y: obs.y});
+                    points.push({x: obs.x + obs.w, y: obs.y});
+                    points.push({x: obs.x, y: obs.y + obs.h});
+                    points.push({x: obs.x + obs.w, y: obs.y + obs.h});
+                } else if (obs.type === 'circle') {
+                    // 圆形取8个近似点
+                    for (let a=0; a<Math.PI*2; a+=Math.PI/4) {
+                        points.push({x: obs.x + Math.cos(a)*obs.r, y: obs.y + Math.sin(a)*obs.r});
+                    }
+                }
+            });
+            return points;
+        }
+
+        // 计算射线相交
+        function getIntersection(ray, segment) {
+            const r_px = ray.a.x, r_py = ray.a.y;
+            const r_dx = ray.b.x - ray.a.x, r_dy = ray.b.y - ray.a.y;
+            const s_px = segment.a.x, s_py = segment.a.y;
+            const s_dx = segment.b.x - segment.a.x, s_dy = segment.b.y - segment.a.y;
+
+            const r_mag = Math.sqrt(r_dx*r_dx + r_dy*r_dy);
+            const s_mag = Math.sqrt(s_dx*s_dx + s_dy*s_dy);
+            if (r_dx/r_mag === s_dx/s_mag && r_dy/r_mag === s_dy/s_mag) return null;
+
+            const T2 = (r_dx*(s_py-r_py) + r_dy*(r_px-s_px))/(s_dx*r_dy - s_dy*r_dx);
+            const T1 = (s_px + s_dx*T2 - r_px)/r_dx;
+
+            if (T1 < 0) return null;
+            if (T2 < 0 || T2 > 1) return null;
+
+            return { x: r_px + r_dx*T1, y: r_py + r_dy*T1, param: T1 };
+        }
+
+        function getVisibilityPolygon(sx, sy) {
+            const endpoints = getEndpoints();
+            let angles = [];
+            endpoints.forEach(p => {
+                const angle = Math.atan2(p.y - sy, p.x - sx);
+                angles.push(angle - 0.00001, angle, angle + 0.00001);
+            });
+
+            // 转化为线段集合
+            let segments = [];
+            obstacles.forEach(obs => {
+                if (obs.type === 'rect') {
+                    segments.push({a:{x:obs.x, y:obs.y}, b:{x:obs.x+obs.w, y:obs.y}});
+                    segments.push({a:{x:obs.x+obs.w, y:obs.y}, b:{x:obs.x+obs.w, y:obs.y+obs.h}});
+                    segments.push({a:{x:obs.x+obs.w, y:obs.y+obs.h}, b:{x:obs.x, y:obs.y+obs.h}});
+                    segments.push({a:{x:obs.x, y:obs.y+obs.h}, b:{x:obs.x, y:obs.y}});
+                }
+            });
+
+            let intersects = [];
+            angles.forEach(angle => {
+                const dx = Math.cos(angle);
+                const dy = Math.sin(angle);
+                const ray = {a: {x:sx, y:sy}, b: {x:sx+dx, y:sy+dy}};
+
+                let closest = null;
+                segments.forEach(seg => {
+                    const intersect = getIntersection(ray, seg);
+                    if (!intersect) return;
+                    if (!closest || intersect.param < closest.param) closest = intersect;
+                });
+
+                if (closest) {
+                    // 物理量程限制
+                    const dist = Math.sqrt((closest.x-sx)**2 + (closest.y-sy)**2);
+                    if (dist > CONFIG.scannerRange) {
+                        intersects.push({
+                            x: sx + dx * CONFIG.scannerRange,
+                            y: sy + dy * CONFIG.scannerRange,
+                            angle: angle,
+                            faded: true
+                        });
+                    } else {
+                        intersects.push({ x: closest.x, y: closest.y, angle: angle, faded: false });
+                    }
+                }
+            });
+
+            intersects.sort((a, b) => a.angle - b.angle);
+            return intersects;
+        }
+
+        function calculateCoverage() {
+            let coveredCount = 0;
+            let totalPossible = 0;
+            const step = CONFIG.gridRes;
+
+            for (let x = roomRect.x + 10; x < roomRect.x + roomRect.w - 10; x += step) {
+                for (let y = roomRect.y + 10; y < roomRect.y + roomRect.h - 10; y += step) {
+                    if (isPointInObstacle(x, y)) continue;
+                    totalPossible++;
+
+                    let visible = false;
+                    for (let s of scanners) {
+                        const dx = x - s.x;
+                        const dy = y - s.y;
+                        const distSq = dx*dx + dy*dy;
+                        if (distSq > CONFIG.scannerRange * CONFIG.scannerRange) continue;
+
+                        // 射线碰撞检查
+                        let blocked = false;
+                        const ray = {a: {x: s.x, y: s.y}, b: {x: x, y: y}};
+                        for (let obs of obstacles) {
+                            if (obs.type !== 'rect') continue; // 简化计算
+                            const segs = [
+                                {a:{x:obs.x, y:obs.y}, b:{x:obs.x+obs.w, y:obs.y}},
+                                {a:{x:obs.x+obs.w, y:obs.y}, b:{x:obs.x+obs.w, y:obs.y+obs.h}},
+                                {a:{x:obs.x+obs.w, y:obs.y+obs.h}, b:{x:obs.x, y:obs.y+obs.h}},
+                                {a:{x:obs.x, y:obs.y+obs.h}, b:{x:obs.x, y:obs.y}}
+                            ];
+                            for(let seg of segs) {
+                                const inter = getIntersection(ray, seg);
+                                if (inter && inter.param < 0.99) {
+                                    blocked = true;
+                                    break;
+                                }
+                            }
+                            if (blocked) break;
+                        }
+                        if (!blocked) {
+                            visible = true;
+                            break;
+                        }
+                    }
+                    if (visible) coveredCount++;
+                }
+            }
+            const rate = totalPossible === 0 ? 0 : (coveredCount / totalPossible * 100).toFixed(1);
+            coverageVal.innerText = rate;
+            if (parseFloat(rate) >= 95) coverageVal.parentElement.classList.replace('text-blue-600', 'text-green-600');
+            else coverageVal.parentElement.classList.replace('text-green-600', 'text-blue-600');
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. 绘制背景和阴影基色
+            ctx.fillStyle = CONFIG.shadowColor;
+            ctx.fillRect(roomRect.x, roomRect.y, roomRect.w, roomRect.h);
+
+            // 2. 绘制扫描可见区域 (多站叠加)
+            ctx.save();
+            // 使用 source-over 叠加半透明色，重叠区域颜色会变深
+            scanners.forEach(s => {
+                const poly = getVisibilityPolygon(s.x, s.y);
+                if (poly.length < 3) return;
+
+                const gradient = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, CONFIG.scannerRange);
+                gradient.addColorStop(0, 'rgba(59, 130, 246, 0.5)');
+                gradient.addColorStop(0.8, 'rgba(59, 130, 246, 0.2)');
+                gradient.addColorStop(1, 'rgba(59, 130, 246, 0)');
+
+                ctx.fillStyle = gradient;
+                ctx.beginPath();
+                ctx.moveTo(poly[0].x, poly[0].y);
+                poly.forEach(p => ctx.lineTo(p.x, p.y));
+                ctx.closePath();
+                ctx.fill();
+            });
+            ctx.restore();
+
+            // 3. 绘制障碍物
+            ctx.fillStyle = CONFIG.obstacleColor;
+            obstacles.forEach(obs => {
+                if (obs.type === 'rect') {
+                    ctx.fillRect(obs.x, obs.y, obs.w, obs.h);
+                } else if (obs.type === 'circle') {
+                    ctx.beginPath();
+                    ctx.arc(obs.x, obs.y, obs.r, 0, Math.PI*2);
+                    ctx.fill();
+                }
+            });
+
+            // 4. 绘制站点图标
+            scanners.forEach(s => {
+                // 站点圆圈
+                ctx.fillStyle = '#1e293b';
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 6, 0, Math.PI*2);
+                ctx.fill();
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // 扫描脉冲效果
+                ctx.strokeStyle = 'rgba(59, 130, 246, 0.8)';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 10 + Math.sin(Date.now()/200)*3, 0, Math.PI*2);
+                ctx.stroke();
+            });
+
+            requestAnimationFrame(draw);
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // 检查是否在房间内且不在障碍物内
+            if (x < roomRect.x || x > roomRect.x + roomRect.w || y < roomRect.y || y > roomRect.y + roomRect.h) return;
+            if (isPointInObstacle(x, y)) return;
+
+            scanners.push({ x, y });
+            scannerCountDisplay.innerText = scanners.length;
+            calculateCoverage();
+        });
+
+        resetBtn.addEventListener('click', () => {
+            scanners = [];
+            scannerCountDisplay.innerText = "0";
+            coverageVal.innerText = "0";
+        });
+
+        // 启动动画循环
+        draw();
+    </script>
+</body>
+</html>
